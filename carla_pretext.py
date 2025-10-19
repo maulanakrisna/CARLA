@@ -3,23 +3,24 @@ import os
 import torch
 import numpy as np
 import pandas
-from utils.mypath import MyPath
+from utils.mypath import MyPath  # util untuk path dataset/model
 
-from utils.config import create_config
+from utils.config import create_config  # memuat konfigurasi env/eksperimen
 from utils.common_config import get_criterion, get_model, get_train_dataset,\
                                 get_val_dataset, get_train_dataloader,\
                                 get_val_dataloader, get_train_transformations,\
                                 get_val_transformations, get_val_transformations1, get_optimizer,\
                                 adjust_learning_rate, inject_sub_anomaly
-from utils.evaluate_utils import contrastive_evaluate
+from utils.evaluate_utils import contrastive_evaluate  # util evaluasi (tidak dipakai langsung di pretext)
 from utils.repository import TSRepository
 from utils.train_utils import pretext_train
-from utils.utils import fill_ts_repository
-from termcolor import colored
+from utils.utils import fill_ts_repository  # mengekstrak fitur dan mengisi repositori TS
+from termcolor import colored  # pewarnaan output log di terminal
 from statsmodels.tsa.stattools import adfuller
 import random
 
 def set_seed(seed):
+    # Set seed untuk reprodusibilitas
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -29,9 +30,9 @@ def set_seed(seed):
 
 set_seed(4)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # pilih GPU jika tersedia
 
-# Parser
+# Parser argumen CLI
 parser = argparse.ArgumentParser(description='pretext')
 parser.add_argument('--config_env',
                     help='Config file for the environment')
@@ -47,23 +48,27 @@ def main():
     # torch.set_num_interop_threads(1) 
 
     print(colored('CARLA Pretext stage --> ', 'yellow'))
+    # Muat konfigurasi gabungan dari env + eksperimen + nama file
     p = create_config(args.config_env, args.config_exp, args.fname)
 
-    model = get_model(p)
+    model = get_model(p)  # inisialisasi arsitektur model sesuai config
     best_model = None
     model = model.to(device)
    
     # CUDNN
     # torch.backends.cudnn.benchmark = True
 
+    # Definisikan transformasi/augmentasi untuk train/val
     train_transforms = get_train_transformations(p)
 
-    sanomaly = inject_sub_anomaly(p)
+    sanomaly = inject_sub_anomaly(p)  # setup injeksi sub-anomali sesuai config
     val_transforms = get_val_transformations1(p)
 
 
+    # Bangun dataset berdasarkan jenis sumber data
     if p['train_db_name'] == 'MSL' or p['train_db_name'] == 'SMAP':
         if p['fname'] == 'All':
+            # Mode gabungkan semua channel pada satelit terkait
             with open(os.path.join(MyPath.db_root_dir('msl'), 'labeled_anomalies.csv'), 'r') as file:
                 csv_reader = pandas.read_csv(file, delimiter=',')
             data_info = csv_reader[csv_reader['spacecraft'] == p['train_db_name']]
@@ -71,6 +76,7 @@ def main():
             for file_name in data_info['chan_id']:
                 p['fname'] = file_name
                 if ii == 0 :
+                    # Inisialisasi dataset train/val pertama kali
                     train_dataset = get_train_dataset(p, train_transforms, sanomaly, to_augmented_dataset=True,
                                                   split='train+unlabeled')
                     val_dataset = get_val_dataset(p, val_transforms, sanomaly, False, train_dataset.mean,
@@ -78,6 +84,7 @@ def main():
                     # base_dataset = get_train_dataset(p, train_transforms, sanomaly, to_augmented_dataset=True,
                     #                                  split='train')
                 else:
+                    # Untuk channel berikutnya, gabungkan ke dataset awal
                     new_train_dataset = get_train_dataset(p, train_transforms, sanomaly, to_augmented_dataset=True,
                                                   split='train+unlabeled')
                     new_val_dataset = get_val_dataset(p, val_transforms, sanomaly, False, new_train_dataset.mean,
@@ -89,6 +96,7 @@ def main():
 
                 ii += 1
         else:
+            # Mode satu channel saja
             train_dataset = get_train_dataset(p, train_transforms, sanomaly, to_augmented_dataset=True,
                                               split='train+unlabeled')
             val_dataset = get_val_dataset(p, val_transforms, sanomaly, False, train_dataset.mean,
@@ -97,6 +105,7 @@ def main():
             #                                  split='train') # Dataset w/o augs for knn eval
 
     elif p['train_db_name'] == 'yahoo':
+        # Khusus dataset Yahoo yang berbentuk file CSV per time series
         filename = os.path.join('/home/zahraz/hz18_scratch/zahraz/datasets/', 'Yahoo/', p['fname'])
         dataset = []
 
@@ -113,6 +122,7 @@ def main():
         l = len(data) // 2
 
         n = 0
+        # Diferensiasi berulang hingga segmen awal stasioner (uji ADF)
         while adfuller(data[:l], 1)[1] > 0.05 or adfuller(data[:l])[1] > 0.05:
             data = np.diff(data)
             labels = labels[1:]
@@ -140,17 +150,19 @@ def main():
 
     elif p['train_db_name'] == 'smd' or p['train_db_name'] == 'kpi' or p['train_db_name'] == 'swat' \
         or p['train_db_name'] == 'swan' or p['train_db_name'] == 'gecco' or p['train_db_name'] == 'wadi' or p['train_db_name'] == 'ucr':
+        # Dataset yang sudah didukung langsung oleh loader util
         train_dataset = get_train_dataset(p, train_transforms, sanomaly, to_augmented_dataset=True)
         val_dataset = get_val_dataset(p, val_transforms, sanomaly, False, train_dataset.mean,
                                       train_dataset.std)
 
+    # DataLoader untuk train/val dan base (untuk ekstraksi fitur train)
     train_dataloader = get_train_dataloader(p, train_dataset)
     val_dataloader = get_val_dataloader(p, val_dataset)
     base_dataloader = get_val_dataloader(p, train_dataset)
 
     print('Dataset contains {}/{} train/val samples'.format(len(train_dataset), len(val_dataset)))
     
-    # TS Repository
+    # TS Repository: struktur penyimpan fitur/embedding untuk operasi nearest/furthest neighbors
    # base_dataset = get_train_dataset(p, train_transforms, panomaly, sanomaly, to_augmented_dataset=True, split='train')
 
     ts_repository_base = TSRepository(len(train_dataset),
@@ -162,13 +174,15 @@ def main():
                                      p['num_classes'], p['criterion_kwargs']['temperature'])
     ts_repository_val.to(device)
 
+    # Loss/criterion untuk pretext (mis. contrastive loss)
     criterion = get_criterion(p)
     criterion = criterion.to(device)
 
+    # Optimizer (gunakan Adam dengan LR dari config)
     # optimizer = get_optimizer(p, model)
     optimizer = torch.optim.Adam(model.parameters(), lr=p['optimizer_kwargs']['lr'])
  
-    # Checkpoint
+    # Checkpoint: lanjutkan training bila file checkpoint tersedia
     if os.path.exists(p['pretext_checkpoint']):
         print(colored('Restart from checkpoint {}'.format(p['pretext_checkpoint']), 'blue'))
         checkpoint = torch.load(p['pretext_checkpoint'], map_location='cpu')
@@ -182,7 +196,7 @@ def main():
         start_epoch = 0
         model = model.to(device)
     
-    # Training
+    # Training loop pretext: simpan model terbaik berdasarkan loss terendah
     pretext_best_loss = np.inf
     prev_loss = None
     for epoch in range(start_epoch, p['epochs']):
@@ -200,11 +214,11 @@ def main():
             pretext_best_loss = tmp_loss
             best_model = model
 
-    # Save final model
+    # Simpan bobot model terbaik
     torch.save(best_model.state_dict(), p['pretext_model'])
 
-    # Mine the topk nearest neighbors at the very end (Train)
-    # These will be served as input to the classification loss.
+    # Proses mining tetangga terdekat/terjauh untuk data train
+    # Hasilnya dipakai pada tahap klasifikasi (loss berbasis tetangga)
     print(colored('Fill TS Repository for mining the nearest/furthest neighbors (train) ...', 'blue'))
     ts_repository_aug = TSRepository(len(train_dataset) * 2,
                                      p['model_kwargs']['features_dim'],
@@ -220,8 +234,7 @@ def main():
     np.save(p['topk_neighbors_train_path'], knearest)
     np.save(p['bottomk_neighbors_train_path'], kfurtherst)
 
-    # Mine the topk nearest neighbors at the very end (Val)
-    # These will be used for validation.
+    # Proses mining tetangga untuk data val (dipakai saat validasi)
     print(colored('Fill TS Repository for mining the nearest/furthest neighbors (val) ...', 'blue'))
 
     fill_ts_repository(p, val_dataloader, model, ts_repository_val, real_aug=False, ts_repository_aug=None)
@@ -237,4 +250,5 @@ def main():
 
  
 if __name__ == '__main__':
+    # Entry point skrip
     main()
